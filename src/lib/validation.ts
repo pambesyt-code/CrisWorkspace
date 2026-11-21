@@ -1,4 +1,4 @@
-import type { SocialPlatform, SocialPlatformId, ValidationIssue } from "@/types/workspace";
+import type { DraftValidationInput, SocialPlatform, ValidationIssue } from "@/types/workspace";
 
 export const MAX_TRIGGER_MINUTE = 600;
 
@@ -19,36 +19,63 @@ export function captionLength(text: string): number {
   return [...text].length;
 }
 
-export interface DraftToValidate {
-  description: string;
-  platforms: SocialPlatformId[];
-  durationSeconds: number | null;
-  triggerMinute: number;
-}
+export type DraftToValidate = DraftValidationInput;
 
 export interface ValidationContext {
   platforms: readonly SocialPlatform[];
   /** Segundos de directo transcurridos si está en marcha, o `null`. */
   liveElapsedSeconds: number | null;
+  /** Hora actual, para comprobar las fechas. */
+  now: number;
 }
+
+/** Margen para aceptar «ahora» aunque pasen unos segundos entre elegir y programar. */
+const PAST_TOLERANCE_MS = 2 * 60_000;
+/** Como mucho se programa con un año de antelación. */
+const MAX_AHEAD_MS = 366 * 24 * 60 * 60_000;
+export const MAX_COVER_BYTES = 10 * 1024 * 1024;
 
 export function validateDraft(draft: DraftToValidate, ctx: ValidationContext): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const length = captionLength(draft.description);
   const mentions = extractMentions(draft.description);
 
-  if (!Number.isInteger(draft.triggerMinute) || draft.triggerMinute < 0 || draft.triggerMinute > MAX_TRIGGER_MINUTE) {
-    issues.push({
-      severity: "error",
-      platform: null,
-      message: `El minuto de publicación debe ser un número entero entre 0 y ${MAX_TRIGGER_MINUTE}.`,
-    });
-  } else if (ctx.liveElapsedSeconds !== null && draft.triggerMinute * 60 <= ctx.liveElapsedSeconds) {
-    issues.push({
-      severity: "warning",
-      platform: null,
-      message: `El directo ya pasó del minuto ${draft.triggerMinute}: el vídeo se publicará en cuanto lo programes.`,
-    });
+  if (draft.scheduleMode === "directo") {
+    if (!Number.isInteger(draft.triggerMinute) || draft.triggerMinute < 0 || draft.triggerMinute > MAX_TRIGGER_MINUTE) {
+      issues.push({
+        severity: "error",
+        platform: null,
+        message: `El minuto de publicación debe ser un número entero entre 0 y ${MAX_TRIGGER_MINUTE}.`,
+      });
+    } else if (ctx.liveElapsedSeconds !== null && draft.triggerMinute * 60 <= ctx.liveElapsedSeconds) {
+      issues.push({
+        severity: "warning",
+        platform: null,
+        message: `El directo ya pasó del minuto ${draft.triggerMinute}: el vídeo se publicará en cuanto lo programes.`,
+      });
+    } else if (ctx.liveElapsedSeconds === null) {
+      issues.push({
+        severity: "warning",
+        platform: null,
+        message: "Se publicará cuando inicies el directo y el reloj llegue a ese minuto.",
+      });
+    }
+  } else if (draft.publishAt === null || !Number.isFinite(draft.publishAt)) {
+    issues.push({ severity: "error", platform: null, message: "Elige la fecha y la hora de publicación." });
+  } else if (draft.publishAt < ctx.now - PAST_TOLERANCE_MS) {
+    issues.push({ severity: "error", platform: null, message: "Esa fecha ya ha pasado. Elige una hora futura o «Ahora»." });
+  } else if (draft.publishAt > ctx.now + MAX_AHEAD_MS) {
+    issues.push({ severity: "error", platform: null, message: "Solo se puede programar con hasta un año de antelación." });
+  }
+
+  if (draft.cover !== null) {
+    if (!draft.cover.mimeType.startsWith("image/")) {
+      issues.push({ severity: "error", platform: null, message: "La portada tiene que ser una imagen (JPG, PNG o WebP)." });
+    } else if (draft.cover.sizeBytes > MAX_COVER_BYTES) {
+      issues.push({ severity: "error", platform: null, message: "La portada pesa más de 10 MB. Usa una imagen más ligera." });
+    } else if (draft.platforms.includes("youtube") && draft.cover.sizeBytes > 2 * 1024 * 1024) {
+      issues.push({ severity: "warning", platform: "youtube", message: "YouTube: las miniaturas deben pesar menos de 2 MB; esta podría rechazarse." });
+    }
   }
 
   if (draft.platforms.length === 0) {
@@ -102,7 +129,7 @@ export function validateDraft(draft: DraftToValidate, ctx: ValidationContext): V
       issues.push({
         severity: "warning",
         platform: id,
-        message: `${displayName} no está conectada: conéctala antes del minuto ${draft.triggerMinute} o esa publicación fallará.`,
+        message: `${displayName} no está conectada: conéctala antes de la hora de publicación o en esa red fallará.`,
       });
     }
   }

@@ -14,6 +14,7 @@ export const DEFAULT_PLATFORMS: readonly SocialPlatform[] = [
     connected: false,
     handle: null,
     brandColor: "#E1306C",
+    supportsCustomCover: true,
     limits: { maxCaptionChars: 2_200, maxVideoSeconds: 180, maxMentions: 20 },
   },
   {
@@ -22,6 +23,7 @@ export const DEFAULT_PLATFORMS: readonly SocialPlatform[] = [
     connected: false,
     handle: null,
     brandColor: "#1877F2",
+    supportsCustomCover: true,
     limits: { maxCaptionChars: 63_206, maxVideoSeconds: 14_400, maxMentions: 50 },
   },
   {
@@ -30,6 +32,7 @@ export const DEFAULT_PLATFORMS: readonly SocialPlatform[] = [
     connected: false,
     handle: null,
     brandColor: "#E7E9EA",
+    supportsCustomCover: false,
     limits: { maxCaptionChars: 280, maxVideoSeconds: 140, maxMentions: 10 },
   },
   {
@@ -38,6 +41,7 @@ export const DEFAULT_PLATFORMS: readonly SocialPlatform[] = [
     connected: false,
     handle: null,
     brandColor: "#25F4EE",
+    supportsCustomCover: false,
     limits: { maxCaptionChars: 4_000, maxVideoSeconds: 600, maxMentions: 20 },
   },
   {
@@ -46,6 +50,7 @@ export const DEFAULT_PLATFORMS: readonly SocialPlatform[] = [
     connected: false,
     handle: null,
     brandColor: "#FF0033",
+    supportsCustomCover: true,
     limits: { maxCaptionChars: 5_000, maxVideoSeconds: 43_200, maxMentions: 15 },
   },
 ];

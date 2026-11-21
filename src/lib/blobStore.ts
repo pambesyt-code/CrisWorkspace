@@ -42,6 +42,7 @@ export async function clearAllBlobs(): Promise<void> {
 
 export const attachmentBlobKey = (attachmentId: string): string => `attachment:${attachmentId}`;
 export const videoBlobKey = (videoId: string): string => `video:${videoId}`;
+export const coverBlobKey = (id: string): string => `portada:${id}`;
 
 /**
  * Descarga un blob como archivo. La URL temporal se revoca en cuanto el

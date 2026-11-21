@@ -15,6 +15,7 @@ import { extractMentions, validateDraft } from "@/lib/validation";
 import { DEFAULT_PLATFORMS, mergePlatforms } from "@/lib/platforms";
 import { useStudioStore } from "@/store/studioStore";
 import { useNotesStore } from "@/store/notesStore";
+import { getBlob } from "@/lib/blobStore";
 import { detectInstallPlatform } from "@/lib/install";
 import { initialSection, sanitizeSettings } from "@/store/settingsStore";
 import type { ScheduledVideoStatus } from "@/types/workspace";
@@ -41,23 +42,31 @@ async function main() {
 
   console.log("Validación y menciones");
   assert.deepEqual(extractMentions("Hola @Ana y @ana, mira @pepe_1. correo: x@y.com"), ["ana", "pepe_1"]);
-  const longX = validateDraft(
-    { description: "a".repeat(281), platforms: ["twitter", "instagram"], durationSeconds: 30, triggerMinute: 20 },
-    { platforms: DEFAULT_PLATFORMS, liveElapsedSeconds: null },
-  );
+  const T = 1_800_000_000_000;
+  const ctx = { platforms: DEFAULT_PLATFORMS, liveElapsedSeconds: null, now: T };
+  const base = { scheduleMode: "directo" as const, publishAt: null, cover: null };
+  const longX = validateDraft({ ...base, description: "a".repeat(281), platforms: ["twitter", "instagram"], durationSeconds: 30, triggerMinute: 20 }, ctx);
   assert.ok(longX.some((i) => i.severity === "error" && i.platform === "twitter"));
   assert.ok(!longX.some((i) => i.severity === "error" && i.platform === "instagram"));
-  const badMinute = validateDraft(
-    { description: "x", platforms: ["youtube"], durationSeconds: 10, triggerMinute: 2.5 },
-    { platforms: DEFAULT_PLATFORMS, liveElapsedSeconds: null },
-  );
+  const badMinute = validateDraft({ ...base, description: "x", platforms: ["youtube"], durationSeconds: 10, triggerMinute: 2.5 }, ctx);
   assert.ok(badMinute.some((i) => i.severity === "error" && i.platform === null));
-  const tooLong = validateDraft(
-    { description: "x", platforms: ["instagram"], durationSeconds: 181, triggerMinute: 0 },
-    { platforms: DEFAULT_PLATFORMS, liveElapsedSeconds: null },
-  );
+  const tooLong = validateDraft({ ...base, description: "x", platforms: ["instagram"], durationSeconds: 181, triggerMinute: 0 }, ctx);
   assert.ok(tooLong.some((i) => i.severity === "error" && i.platform === "instagram"));
   ok("límites por red, minuto inválido y duración");
+
+  const dated = (publishAt: number | null) =>
+    validateDraft({ ...base, scheduleMode: "fecha", publishAt, description: "x", platforms: ["instagram"], durationSeconds: 10, triggerMinute: 0 }, ctx).filter((i) => i.severity === "error");
+  assert.equal(dated(T + 3_600_000).length, 0); // dentro de 1 hora
+  assert.equal(dated(T - 30_000).length, 0); // «ahora» con unos segundos de retraso
+  assert.equal(dated(T - 3_600_000).length, 1); // hace 1 hora
+  assert.equal(dated(null).length, 1);
+  assert.equal(dated(T + 400 * 86_400_000).length, 1); // más de un año
+  const coverCheck = (mimeType: string, sizeBytes: number) =>
+    validateDraft({ ...base, cover: { mimeType, sizeBytes }, description: "x", platforms: ["youtube"], durationSeconds: 10, triggerMinute: 0 }, ctx);
+  assert.ok(coverCheck("application/pdf", 100).some((i) => i.severity === "error"));
+  assert.ok(coverCheck("image/png", 11 * 1024 * 1024).some((i) => i.severity === "error"));
+  assert.ok(coverCheck("image/jpeg", 3 * 1024 * 1024).some((i) => i.severity === "warning" && i.platform === "youtube"));
+  ok("fechas pasadas, sin fecha o a más de un año, y portadas no válidas");
 
   const merged = mergePlatforms([{ id: "twitter", connected: true, handle: "cris", limits: { maxCaptionChars: 1 } }, { id: "nope" }]);
   assert.equal(merged.length, 5);
@@ -139,7 +148,11 @@ async function main() {
       file: video(name),
       description: `Directo ${name} con @invitado`,
       platforms: ["instagram", "twitter", "tiktok"],
+      scheduleMode: "directo",
       triggerMinute: minute,
+      publishAt: null,
+      cover: null,
+      coverSource: null,
     });
     assert.deepEqual(issues, [], `programar ${name}`);
   };
@@ -243,6 +256,97 @@ async function main() {
   assert.equal(useStudioStore.getState().broadcast.elapsedSeconds, 0);
   assert.equal(getDueVideos(useStudioStore.getState().broadcast.queue, start, start + 1e9).length, 0);
   ok("detener y reiniciar el reloj");
+
+  console.log("Agenda: publicar en una fecha, sin directo");
+  const portada = (texto: string) => new Blob([texto], { type: "image/jpeg" });
+  const blobExists = async (key: string | null) => (key ? (await getBlob(key)) !== null : false);
+  const t0 = Date.now();
+  const agendaIssues = await useStudioStore.getState().scheduleVideo({
+    file: video("agenda.mp4"),
+    description: "Vídeo con fecha",
+    platforms: ["instagram", "twitter"],
+    scheduleMode: "fecha",
+    triggerMinute: 0,
+    publishAt: t0 + 5_000,
+    cover: portada("portada-1"),
+    coverSource: "fotograma",
+  });
+  assert.deepEqual(agendaIssues, []);
+  const agenda = () => useStudioStore.getState().broadcast.queue.find((v) => v.fileName === "agenda.mp4");
+  assert.equal(useStudioStore.getState().broadcast.isRunning, false);
+  assert.ok(await blobExists(agenda()?.coverBlobKey ?? null), "la portada se guarda");
+  assert.equal(agenda()?.coverSource, "fotograma");
+  useStudioStore.getState().tick(t0 + 4_000);
+  assert.equal(agenda()?.status, "pending", "no sale antes de su hora");
+  useStudioStore.getState().tick(t0 + 5_000);
+  assert.equal(agenda()?.status, "uploading", "sale a su hora aunque no haya directo");
+  useStudioStore.getState().tick(t0 + 6_000);
+  const deadline3 = Date.now() + 20_000;
+  while (agenda()?.status === "uploading" && Date.now() < deadline3) await sleep(200);
+  assert.equal(agenda()?.status, "published");
+  ok("un vídeo con fecha se publica a su hora, una vez, con su portada y sin directo");
+
+  const sinDirectoIssues = await useStudioStore.getState().scheduleVideo({
+    file: video("sin-directo.mp4"),
+    description: "Espera al directo",
+    platforms: ["instagram", "twitter"],
+    scheduleMode: "directo",
+    triggerMinute: 0,
+    publishAt: null,
+    cover: null,
+    coverSource: null,
+  });
+  assert.deepEqual(sinDirectoIssues, []);
+  const sd = () => useStudioStore.getState().broadcast.queue.find((v) => v.fileName === "sin-directo.mp4");
+  useStudioStore.getState().tick(Date.now() + 1e9);
+  assert.equal(sd()?.status, "pending");
+  ok("un vídeo del directo no sale mientras el directo está parado");
+
+  const id = sd()?.id ?? "";
+  useStudioStore.getState().togglePlatform(id, "instagram", false);
+  assert.deepEqual(sd()?.platforms, ["twitter"]);
+  useStudioStore.getState().togglePlatform(id, "twitter", false);
+  assert.deepEqual(sd()?.platforms, ["twitter"], "siempre queda una red");
+  useStudioStore.getState().togglePlatform(id, "tiktok", true);
+  assert.deepEqual(sd()?.platforms, ["twitter", "tiktok"]);
+  ok("redes activables y desactivables, sin quedarse en cero");
+
+  await useStudioStore.getState().updateCover(id, portada("a"), "imagen");
+  const key1 = sd()?.coverBlobKey ?? null;
+  assert.ok(await blobExists(key1));
+  await useStudioStore.getState().updateCover(id, portada("b"), "fotograma");
+  const key2 = sd()?.coverBlobKey ?? null;
+  assert.ok(key2 !== key1 && (await blobExists(key2)));
+  await sleep(50);
+  assert.equal(await blobExists(key1), false, "la portada vieja se borra");
+  await useStudioStore.getState().updateCover(id, null, null);
+  assert.equal(sd()?.coverBlobKey, null);
+  await sleep(50);
+  assert.equal(await blobExists(key2), false);
+  await useStudioStore.getState().updateCover(id, new Blob(["x"], { type: "text/plain" }), "imagen");
+  assert.equal(sd()?.coverBlobKey, null, "un archivo que no es imagen se rechaza");
+  ok("poner, cambiar y quitar la portada sin dejar archivos huérfanos");
+
+  useStudioStore.getState().updateSchedule(id, { scheduleMode: "fecha", triggerMinute: 0, publishAt: Date.now() + 3_600_000 });
+  assert.equal(sd()?.scheduleMode, "fecha");
+  assert.equal(sd()?.status, "pending");
+  useStudioStore.getState().publishNow(id);
+  assert.equal(sd()?.status, "uploading", "«Publicar ya» sale al momento");
+  ok("cambiar la programación y «Publicar ya»");
+
+  const merge = useStudioStore.persist.getOptions().merge;
+  assert.ok(merge);
+  const restored = merge(
+    { broadcast: { isRunning: false, startTimeTimestamp: null, queue: [{ id: "viejo", videoBlobKey: "video:viejo", platforms: ["instagram"], triggerMinute: 20, status: "pending" }] } },
+    useStudioStore.getState(),
+  );
+  const viejo = restored.broadcast.queue[0];
+  assert.equal(viejo?.scheduleMode, "directo");
+  assert.equal(viejo?.publishAt, null);
+  assert.equal(viejo?.coverBlobKey, null);
+  assert.equal(viejo?.triggerMinute, 20);
+  assert.equal(restored.platforms.find((p) => p.id === "twitter")?.supportsCustomCover, false);
+  ok("los vídeos guardados con la versión anterior siguen cargando");
 
   console.log(`\n${passed} comprobaciones superadas.`);
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import { hasPendingDated } from "@/lib/broadcast/clock";
 import { startTicker } from "@/lib/broadcast/ticker";
 import { notesStorage, useNotesStore } from "@/store/notesStore";
 import { settingsStorage, useSettingsStore } from "@/store/settingsStore";
@@ -71,12 +72,16 @@ export function useBroadcastEngine(): void {
   const isRunning = useStudioStore((s) => s.broadcast.isRunning);
   const startTimestamp = useStudioStore((s) => s.broadcast.startTimeTimestamp);
   const hydrated = useStudioStore((s) => s.hydrated);
+  // La agenda (vídeos con fecha) también necesita el motor, aunque no haya directo.
+  const hasDated = useStudioStore((s) => hasPendingDated(s.broadcast.queue));
+  const live = isRunning && startTimestamp !== null;
 
   useEffect(() => {
-    if (!hydrated || !isRunning || startTimestamp === null) return;
+    if (!hydrated || (!live && !hasDated)) return;
     const tick = () => useStudioStore.getState().tick();
     tick();
-    const ticker = startTicker(startTimestamp, tick);
+    // Con directo, los tics se alinean con su inicio; sin él, con los segundos del reloj.
+    const ticker = startTicker(live && startTimestamp !== null ? startTimestamp : 0, tick);
     const onVisibility = () => {
       if (document.visibilityState === "visible") tick();
     };
@@ -87,5 +92,42 @@ export function useBroadcastEngine(): void {
       window.removeEventListener("focus", tick);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [hydrated, isRunning, startTimestamp]);
+  }, [hydrated, live, hasDated, startTimestamp]);
+}
+
+/*
+ * Reloj compartido para las cuentas atrás en pantalla. La hora solo se lee en
+ * el navegador (nunca al generar la página en el servidor, donde vale 0).
+ */
+let currentNow = 0;
+const nowListeners = new Set<() => void>();
+let nowTimer: number | null = null;
+
+function subscribeNow(listener: () => void): () => void {
+  nowListeners.add(listener);
+  if (nowTimer === null) {
+    nowTimer = window.setInterval(() => {
+      currentNow = Date.now();
+      for (const l of nowListeners) l();
+    }, 1000);
+  }
+  return () => {
+    nowListeners.delete(listener);
+    if (nowListeners.size === 0 && nowTimer !== null) {
+      window.clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  };
+}
+
+const noSubscribe = () => () => {};
+
+function getNowSnapshot(): number {
+  if (currentNow === 0) currentNow = Date.now();
+  return currentNow;
+}
+
+/** Hora actual que se actualiza cada segundo (solo mientras `active`). */
+export function useNow(active: boolean): number {
+  return useSyncExternalStore(active ? subscribeNow : noSubscribe, getNowSnapshot, () => 0);
 }

@@ -129,7 +129,20 @@ export interface SocialPlatform {
   limits: PlatformLimits;
   /** Color de marca en hexadecimal, para la interfaz. */
   brandColor: string;
+  /** La red permite elegir una portada propia. Si es false, usa un fotograma del vídeo. */
+  supportsCustomCover: boolean;
 }
+
+/**
+ * Cuándo se publica un vídeo:
+ * - "directo": en el minuto `triggerMinute` del Reloj Maestro (solo con el directo en marcha).
+ * - "fecha": en el instante `publishAt` del calendario, haya directo o no.
+ *   («Publicar ahora» es una "fecha" igual al momento de programarlo.)
+ */
+export type ScheduleMode = "directo" | "fecha";
+
+/** Portada del vídeo: imagen subida por el usuario o fotograma sacado del propio vídeo. */
+export type CoverSource = "imagen" | "fotograma";
 
 export type ScheduledVideoStatus = "pending" | "uploading" | "published" | "error";
 
@@ -161,8 +174,16 @@ export interface ScheduledVideo {
   /** Menciones sin la arroba, sin duplicados, en minúsculas. */
   mentions: string[];
   platforms: SocialPlatformId[];
-  /** Minuto del directo en el que se publica (0 = al iniciar). Entero ≥ 0. */
+  scheduleMode: ScheduleMode;
+  /** Minuto del directo en el que se publica (0 = al iniciar). Entero ≥ 0. Se usa si `scheduleMode` es "directo". */
   triggerMinute: number;
+  /** Fecha y hora de publicación. Se usa si `scheduleMode` es "fecha"; `null` en modo "directo". */
+  publishAt: EpochMs | null;
+  /** Clave del `Blob` de la portada en IndexedDB, o `null` si no tiene portada propia. */
+  coverBlobKey: string | null;
+  coverSource: CoverSource | null;
+  /** `blob:` URL de la portada para mostrarla. Solo en memoria, nunca se persiste. */
+  coverUrl: string | null;
   status: ScheduledVideoStatus;
   /** Resultado por plataforma del último intento. */
   results: Partial<Record<SocialPlatformId, PlatformPublishResult>>;
@@ -186,7 +207,26 @@ export interface NewScheduledVideoInput {
   file: File;
   description: string;
   platforms: SocialPlatformId[];
+  scheduleMode: ScheduleMode;
+  /** Solo cuenta en modo "directo". */
   triggerMinute: number;
+  /** Solo cuenta en modo "fecha". */
+  publishAt: EpochMs | null;
+  /** Portada elegida, o `null` para no poner portada propia. */
+  cover: Blob | null;
+  coverSource: CoverSource | null;
+}
+
+/** Datos del formulario que se validan en vivo. */
+export interface DraftValidationInput {
+  description: string;
+  platforms: SocialPlatformId[];
+  durationSeconds: number | null;
+  scheduleMode: ScheduleMode;
+  triggerMinute: number;
+  publishAt: EpochMs | null;
+  /** Portada elegida (tipo y tamaño), o `null`. */
+  cover: { mimeType: string; sizeBytes: number } | null;
 }
 
 export type ValidationSeverity = "error" | "warning";
@@ -335,18 +375,28 @@ export interface VideoStudioSectionProps {
   /** Menciones usadas antes, sin arroba, para el autocompletado. */
   mentionSuggestions: string[];
   /** Validación en vivo del formulario (límites de cada red). */
-  validateDraft: (draft: {
-    description: string;
-    platforms: SocialPlatformId[];
-    durationSeconds: number | null;
-    triggerMinute: number;
-  }) => ValidationIssue[];
+  validateDraft: (draft: DraftValidationInput) => ValidationIssue[];
+  /**
+   * Saca un fotograma del vídeo como imagen JPEG para usarlo de portada.
+   * `atSeconds` es el segundo del vídeo. Resuelve `null` si no se pudo.
+   */
+  captureFrame: (video: Blob, atSeconds: number) => Promise<Blob | null>;
+  /** Hora actual (ms). Úsala como mínimo del selector de fecha; se actualiza cada segundo. */
+  now: EpochMs;
   /** Programa el vídeo. Resuelve con los problemas que impidieron hacerlo (array vacío = éxito). */
   onScheduleVideo: (input: NewScheduledVideoInput) => Promise<ValidationIssue[]>;
   onRemoveVideo: (videoId: Id) => void;
   /** Vuelve a `pending` un vídeo con error; solo reintenta las redes que fallaron. */
   onRetryVideo: (videoId: Id) => void;
   onUpdateTriggerMinute: (videoId: Id, minute: number) => void;
+  /** Cambia cuándo se publica un vídeo pendiente (modo y minuto o fecha). */
+  onUpdateSchedule: (videoId: Id, schedule: { scheduleMode: ScheduleMode; triggerMinute: number; publishAt: EpochMs | null }) => void;
+  /** Activa o desactiva una red para un vídeo pendiente. */
+  onTogglePlatform: (videoId: Id, platformId: SocialPlatformId, enabled: boolean) => void;
+  /** Pone, cambia o quita (`null`) la portada de un vídeo pendiente. */
+  onUpdateCover: (videoId: Id, cover: Blob | null, source: CoverSource | null) => void;
+  /** Publica ya un vídeo pendiente (cambia su programación a "fecha" = ahora). */
+  onPublishNow: (videoId: Id) => void;
 
   /** Inicia el directo desde 00:00:00. */
   onStartBroadcast: () => void;

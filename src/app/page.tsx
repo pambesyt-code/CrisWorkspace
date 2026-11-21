@@ -10,7 +10,8 @@ import { NotionSection } from "@/components/NotionSection";
 import { VideoStudioSection } from "@/components/VideoStudioSection";
 import { SettingsSection } from "@/components/SettingsSection";
 import { InstallGuide } from "@/components/InstallGuide";
-import { useBroadcastEngine, usePersistence, useServiceWorker } from "@/hooks/useWorkspaceEngine";
+import { useBroadcastEngine, useNow, usePersistence, useServiceWorker } from "@/hooks/useWorkspaceEngine";
+import { captureVideoFrame } from "@/lib/media";
 import { deleteAllData, exportBackup, getStorageUsage, importBackup } from "@/lib/backup";
 import { timelineMaxMinute } from "@/lib/broadcast/clock";
 import { buildTree, countItems } from "@/lib/notesTree";
@@ -96,6 +97,8 @@ export default function WorkspacePage() {
   }, [platforms, mentionHistory]);
 
   const maxMinute = timelineMaxMinute(broadcast.queue, broadcast.elapsedSeconds);
+  // Reloj para las cuentas atrás de la agenda (solo mientras se ve el Estudio).
+  const now = useNow(section === "estudio");
   const scheduledVideos = broadcast.queue.filter((v) => v.status === "pending" || v.status === "uploading").length;
 
   /* ── Datos (Ajustes) ──────────────────────────────────────────────────── */
@@ -239,6 +242,14 @@ export default function WorkspacePage() {
                   onRemoveVideo={studio.removeVideo}
                   onRetryVideo={studio.retryVideo}
                   onUpdateTriggerMinute={studio.updateTriggerMinute}
+                  onUpdateSchedule={studio.updateSchedule}
+                  onTogglePlatform={studio.togglePlatform}
+                  onUpdateCover={(videoId, cover, source) => {
+                    void studio.updateCover(videoId, cover, source);
+                  }}
+                  onPublishNow={studio.publishNow}
+                  captureFrame={captureVideoFrame}
+                  now={now}
                   onStartBroadcast={studio.startBroadcast}
                   onStopBroadcast={studio.stopBroadcast}
                   onResetBroadcast={studio.resetBroadcast}

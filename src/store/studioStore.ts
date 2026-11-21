@@ -2,21 +2,23 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import type {
   BroadcastState,
+  CoverSource,
   EpochMs,
   Id,
   NewScheduledVideoInput,
   PlatformPublishResult,
+  ScheduleMode,
   ScheduledVideo,
   ScheduledVideoStatus,
   SocialPlatform,
   SocialPlatformId,
   ValidationIssue,
 } from "@/types/workspace";
-import { deleteBlob, getBlob, putBlob, videoBlobKey } from "@/lib/blobStore";
+import { coverBlobKey, deleteBlobs, getBlob, putBlob, videoBlobKey } from "@/lib/blobStore";
 import { elapsedSecondsAt, getDueVideos } from "@/lib/broadcast/clock";
 import { createDebouncedIdbStorage } from "@/lib/idbStorage";
 import { createId } from "@/lib/ids";
-import { createPreviewUrl, readVideoDuration, revokePreviewUrl } from "@/lib/media";
+import { createCoverUrl, createPreviewUrl, readVideoDuration, revokeCoverUrl, revokePreviewUrl } from "@/lib/media";
 import { DEFAULT_PLATFORMS, isPlatformId, mergePlatforms, normalizeHandle } from "@/lib/platforms";
 import { buildPayload, publishToPlatforms } from "@/lib/publishing/publishers";
 import { extractMentions, hasBlockingIssues, MAX_TRIGGER_MINUTE, validateDraft, type DraftToValidate } from "@/lib/validation";
@@ -44,6 +46,10 @@ export interface StudioState {
   removeVideo: (videoId: Id) => void;
   retryVideo: (videoId: Id) => void;
   updateTriggerMinute: (videoId: Id, minute: number) => void;
+  updateSchedule: (videoId: Id, schedule: { scheduleMode: ScheduleMode; triggerMinute: number; publishAt: EpochMs | null }) => void;
+  togglePlatform: (videoId: Id, platformId: SocialPlatformId, enabled: boolean) => void;
+  updateCover: (videoId: Id, cover: Blob | null, source: CoverSource | null) => Promise<void>;
+  publishNow: (videoId: Id) => void;
 
   startBroadcast: () => void;
   stopBroadcast: () => void;
@@ -109,6 +115,11 @@ function sanitizeQueue(raw: unknown): ScheduledVideo[] {
       error = "La página se cerró durante la subida. Pulsa «Reintentar».";
     }
     const trigger = typeof v.triggerMinute === "number" && Number.isInteger(v.triggerMinute) ? v.triggerMinute : 0;
+    // Los vídeos guardados antes de la versión 1.2 no tenían modo: eran todos del directo.
+    const publishAt = typeof v.publishAt === "number" && Number.isFinite(v.publishAt) ? v.publishAt : null;
+    const scheduleMode: ScheduleMode = v.scheduleMode === "fecha" && publishAt !== null ? "fecha" : "directo";
+    const coverSources: readonly CoverSource[] = ["imagen", "fotograma"];
+    const coverBlobKey = typeof v.coverBlobKey === "string" ? v.coverBlobKey : null;
     return [
       {
         id: v.id,
@@ -121,7 +132,12 @@ function sanitizeQueue(raw: unknown): ScheduledVideo[] {
         description: typeof v.description === "string" ? v.description : "",
         mentions: Array.isArray(v.mentions) ? v.mentions.filter((m): m is string => typeof m === "string") : [],
         platforms,
+        scheduleMode,
         triggerMinute: Math.min(MAX_TRIGGER_MINUTE, Math.max(0, trigger)),
+        publishAt: scheduleMode === "fecha" ? publishAt : null,
+        coverBlobKey,
+        coverSource: coverBlobKey ? (coverSources.find((s) => s === v.coverSource) ?? "imagen") : null,
+        coverUrl: null,
         status,
         results,
         error,
@@ -158,6 +174,7 @@ export const useStudioStore = create<StudioState>()(
         return validateDraft(draft, {
           platforms,
           liveElapsedSeconds: broadcast.isRunning ? broadcast.elapsedSeconds : null,
+          now: Date.now(),
         });
       },
 
@@ -171,16 +188,22 @@ export const useStudioStore = create<StudioState>()(
           description: input.description,
           platforms,
           durationSeconds,
+          scheduleMode: input.scheduleMode,
           triggerMinute: input.triggerMinute,
+          publishAt: input.publishAt,
+          cover: input.cover ? { mimeType: input.cover.type, sizeBytes: input.cover.size } : null,
         });
         if (hasBlockingIssues(issues)) return issues.filter((i) => i.severity === "error");
 
         const id = createId();
         const blobKey = videoBlobKey(id);
+        const coverKey = input.cover ? coverBlobKey(id) : null;
         try {
           await putBlob(blobKey, input.file);
+          if (input.cover && coverKey) await putBlob(coverKey, input.cover);
         } catch (error) {
           console.error("[CrisWorkspace] No se pudo guardar el vídeo", error);
+          void deleteBlobs(coverKey ? [blobKey, coverKey] : [blobKey]);
           return [{ severity: "error", platform: null, message: "No se pudo guardar el vídeo en el navegador (¿falta espacio?)." }];
         }
 
@@ -196,7 +219,12 @@ export const useStudioStore = create<StudioState>()(
           description: input.description,
           mentions,
           platforms,
-          triggerMinute: input.triggerMinute,
+          scheduleMode: input.scheduleMode,
+          triggerMinute: input.scheduleMode === "directo" ? input.triggerMinute : 0,
+          publishAt: input.scheduleMode === "fecha" ? input.publishAt : null,
+          coverBlobKey: coverKey,
+          coverSource: input.cover ? (input.coverSource ?? "imagen") : null,
+          coverUrl: input.cover ? createCoverUrl(id, input.cover) : null,
           status: "pending",
           results: {},
           error: null,
@@ -207,7 +235,7 @@ export const useStudioStore = create<StudioState>()(
           broadcast: { ...state.broadcast, queue: [...state.broadcast.queue, video] },
           mentionHistory: [...new Set([...mentions, ...state.mentionHistory])].slice(0, MAX_MENTION_HISTORY),
         }));
-        // Si el directo ya está en marcha y el minuto ya pasó, se publica en este mismo instante.
+        // «Ahora», una fecha ya alcanzada o un minuto del directo ya pasado: se publica en este mismo instante.
         get().tick();
         return [];
       },
@@ -217,7 +245,89 @@ export const useStudioStore = create<StudioState>()(
         if (!video || video.status === "uploading" || inFlight.has(videoId)) return;
         set((state) => ({ broadcast: { ...state.broadcast, queue: state.broadcast.queue.filter((v) => v.id !== videoId) } }));
         revokePreviewUrl(videoId);
-        void deleteBlob(video.videoBlobKey).catch((error: unknown) => console.error("[CrisWorkspace] No se pudo borrar el vídeo", error));
+        revokeCoverUrl(videoId);
+        void deleteBlobs(video.coverBlobKey ? [video.videoBlobKey, video.coverBlobKey] : [video.videoBlobKey]);
+      },
+
+      updateSchedule: (videoId, schedule) => {
+        const isDated = schedule.scheduleMode === "fecha";
+        if (isDated && (schedule.publishAt === null || !Number.isFinite(schedule.publishAt))) return;
+        const minute = Math.min(MAX_TRIGGER_MINUTE, Math.max(0, Math.round(Number.isFinite(schedule.triggerMinute) ? schedule.triggerMinute : 0)));
+        set((state) => {
+          const video = state.broadcast.queue.find((v) => v.id === videoId);
+          if (!video || video.status !== "pending") return state;
+          return {
+            broadcast: {
+              ...state.broadcast,
+              queue: replaceVideo(state.broadcast.queue, videoId, (v) => ({
+                ...v,
+                scheduleMode: schedule.scheduleMode,
+                triggerMinute: isDated ? v.triggerMinute : minute,
+                publishAt: isDated ? schedule.publishAt : null,
+              })),
+            },
+          };
+        });
+        get().tick();
+      },
+
+      togglePlatform: (videoId, platformId, enabled) =>
+        set((state) => {
+          const video = state.broadcast.queue.find((v) => v.id === videoId);
+          if (!video || video.status !== "pending") return state;
+          const has = video.platforms.includes(platformId);
+          if (enabled === has) return state;
+          // Siempre queda al menos una red: un vídeo sin redes no tiene dónde publicarse.
+          if (!enabled && video.platforms.length <= 1) return state;
+          const platforms = enabled ? [...video.platforms, platformId] : video.platforms.filter((p) => p !== platformId);
+          return { broadcast: { ...state.broadcast, queue: replaceVideo(state.broadcast.queue, videoId, (v) => ({ ...v, platforms })) } };
+        }),
+
+      updateCover: async (videoId, cover, source) => {
+        const video = get().broadcast.queue.find((v) => v.id === videoId);
+        if (!video || video.status !== "pending") return;
+        if (cover !== null && !cover.type.startsWith("image/")) return;
+        const oldKey = video.coverBlobKey;
+        let newKey: string | null = null;
+        if (cover) {
+          // Clave nueva: si algo falla a medias, la portada anterior sigue intacta.
+          newKey = coverBlobKey(`${videoId}:${createId()}`);
+          try {
+            await putBlob(newKey, cover);
+          } catch (error) {
+            console.error("[CrisWorkspace] No se pudo guardar la portada", error);
+            return;
+          }
+        }
+        let applied = false;
+        set((state) => {
+          const current = state.broadcast.queue.find((v) => v.id === videoId);
+          if (!current || current.status !== "pending") return state;
+          applied = true;
+          return {
+            broadcast: {
+              ...state.broadcast,
+              queue: replaceVideo(state.broadcast.queue, videoId, (v) => ({
+                ...v,
+                coverBlobKey: newKey,
+                coverSource: cover ? (source ?? "imagen") : null,
+                coverUrl: cover ? createCoverUrl(videoId, cover) : null,
+              })),
+            },
+          };
+        });
+        if (!applied) {
+          if (newKey) void deleteBlobs([newKey]);
+          return;
+        }
+        if (!cover) revokeCoverUrl(videoId);
+        if (oldKey) void deleteBlobs([oldKey]);
+      },
+
+      publishNow: (videoId) => {
+        const video = get().broadcast.queue.find((v) => v.id === videoId);
+        if (!video || video.status !== "pending") return;
+        get().updateSchedule(videoId, { scheduleMode: "fecha", triggerMinute: video.triggerMinute, publishAt: Date.now() });
       },
 
       retryVideo: (videoId) => {
@@ -270,12 +380,15 @@ export const useStudioStore = create<StudioState>()(
 
       tick: (now = Date.now()) => {
         const { broadcast } = get();
-        if (!broadcast.isRunning || broadcast.startTimeTimestamp === null) return;
-        const elapsed = elapsedSecondsAt(broadcast.startTimeTimestamp, now);
-        if (elapsed !== broadcast.elapsedSeconds) {
-          set((state) => ({ broadcast: { ...state.broadcast, elapsedSeconds: elapsed } }));
+        const live = broadcast.isRunning && broadcast.startTimeTimestamp !== null ? broadcast.startTimeTimestamp : null;
+        if (live !== null) {
+          const elapsed = elapsedSecondsAt(live, now);
+          if (elapsed !== broadcast.elapsedSeconds) {
+            set((state) => ({ broadcast: { ...state.broadcast, elapsedSeconds: elapsed } }));
+          }
         }
-        for (const video of getDueVideos(broadcast.queue, broadcast.startTimeTimestamp, now)) {
+        // Los vídeos con fecha salen aunque no haya directo; los del directo, solo con el reloj en marcha.
+        for (const video of getDueVideos(broadcast.queue, live, now)) {
           void get().publishVideo(video.id);
         }
       },
@@ -300,6 +413,8 @@ export const useStudioStore = create<StudioState>()(
           // Solo se envía a las redes que aún no tienen una publicación correcta.
           const targets = video.platforms.filter((p) => video.results[p]?.ok !== true);
           const blob = await getBlob(video.videoBlobKey);
+          // Si la portada se perdió, se publica igual con el fotograma automático.
+          const cover = video.coverBlobKey ? await getBlob(video.coverBlobKey) : null;
           let newResults: PlatformPublishResult[];
           if (!blob) {
             const now = Date.now();
@@ -311,6 +426,7 @@ export const useStudioStore = create<StudioState>()(
               fileName: video.fileName,
               description: video.description,
               durationSeconds: video.durationSeconds,
+              cover,
             });
             newResults = await publishToPlatforms(payload, targets, get().platforms);
           }
@@ -357,7 +473,7 @@ export const useStudioStore = create<StudioState>()(
           isRunning: state.broadcast.isRunning,
           startTimeTimestamp: state.broadcast.startTimeTimestamp,
           // La URL de vista previa solo existe en memoria.
-          queue: state.broadcast.queue.map((v) => ({ ...v, previewUrl: null })),
+          queue: state.broadcast.queue.map((v) => ({ ...v, previewUrl: null, coverUrl: null })),
         },
       }),
       merge: (persisted, current) => {
@@ -392,12 +508,15 @@ export const useStudioStore = create<StudioState>()(
 async function restorePreviews(queue: readonly ScheduledVideo[]): Promise<void> {
   const missing: Id[] = [];
   const urls = new Map<Id, string>();
+  const coverUrls = new Map<Id, string>();
   await Promise.all(
     queue.map(async (video) => {
       try {
         const blob = await getBlob(video.videoBlobKey);
         if (blob) urls.set(video.id, createPreviewUrl(video.id, blob));
         else missing.push(video.id);
+        const cover = video.coverBlobKey ? await getBlob(video.coverBlobKey) : null;
+        if (cover) coverUrls.set(video.id, createCoverUrl(video.id, cover));
       } catch {
         missing.push(video.id);
       }
@@ -408,7 +527,8 @@ async function restorePreviews(queue: readonly ScheduledVideo[]): Promise<void> 
       ...state.broadcast,
       queue: state.broadcast.queue.map((v) => {
         const url = urls.get(v.id);
-        if (url) return { ...v, previewUrl: url };
+        const coverUrl = coverUrls.get(v.id) ?? null;
+        if (url) return { ...v, previewUrl: url, coverUrl };
         if (missing.includes(v.id) && v.status === "pending") {
           return { ...v, status: "error", error: "El archivo de vídeo ya no está guardado en este navegador." };
         }

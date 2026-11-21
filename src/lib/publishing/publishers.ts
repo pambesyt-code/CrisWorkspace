@@ -20,6 +20,9 @@ export interface PublishPayload {
   description: string;
   mentions: string[];
   durationSeconds: number | null;
+  /** Portada propia, o 
+ull (la red usa un fotograma del vídeo). */
+  cover: Blob | null;
 }
 
 export interface PublishReceipt {
@@ -75,6 +78,10 @@ function createSimulatedPublisher(platform: SocialPlatformId, minDelayMs: number
       }
       if (payload.durationSeconds !== null && payload.durationSeconds > limits.maxVideoSeconds) {
         throw new PublishError(`Vídeo demasiado largo (${Math.round(payload.durationSeconds)} s / ${limits.maxVideoSeconds} s).`);
+      }
+      // Las redes sin portada propia ignoran la imagen y usan un fotograma.
+      if (payload.cover !== null && account.supportsCustomCover && !payload.cover.type.startsWith("image/")) {
+        throw new PublishError("La portada no es una imagen válida.");
       }
       if (payload.video.size === 0) {
         throw new PublishError("El archivo de vídeo está vacío.");
@@ -145,6 +152,7 @@ export function buildPayload(input: {
   fileName: string;
   description: string;
   durationSeconds: number | null;
+  cover: Blob | null;
 }): PublishPayload {
   return { ...input, mentions: extractMentions(input.description) };
 }
